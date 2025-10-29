@@ -4,10 +4,9 @@ import Darwin
 
 let engine = AVAudioEngine()
 let inputNode = engine.inputNode
-let mainMixer = engine.mainMixerNode
 let inputFormat = inputNode.outputFormat(forBus: 0)
 
-engine.connect(inputNode, to: mainMixer, format: inputFormat)
+engine.connect(inputNode, to: engine.outputNode, format: inputFormat)
 
 do {
     try engine.start()

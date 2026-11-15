@@ -1,1 +1,14 @@
-AudioMonitor
+# Cargo build output. Keep Cargo.lock tracked for reproducible application builds.
+/target/
+
+# Rustfmt backups.
+**/*.rs.bk
+
+# macOS metadata.
+.DS_Store
+
+# Local editor temporary files.
+*.swp
+*.swo
+*~
+

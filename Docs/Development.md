@@ -16,6 +16,7 @@ Once dependencies have been fetched, add `--offline` to build, test, and Clippy 
 ## Source layout
 
 - `src/main.rs`: terminal lifecycle, device selection, feedback confirmation, and rendering.
+- `src/meters.rs`: responsive input meter rendering and UI-thread peak/clip holds.
 - `src/audio.rs`: device configuration, stream lifecycle, metering, buffering, and sample-rate conversion.
 - `src/safety.rs`: device-name feedback heuristic and its tests.
 - `src/state.rs`: JSON persistence, buffer validation, and unambiguous device-name matching.
@@ -45,6 +46,8 @@ Queue telemetry is a snapshot before a refill and excludes resampler, driver, an
 `Stats` contains independent atomic telemetry and control values. Relaxed ordering is sufficient because these values do not publish other memory; ring-buffer synchronization is handled by `rtrb`. UI readings are approximate and are not a coherent snapshot of all counters.
 
 Peak and RMS values are stored as f32 bit patterns in AtomicU32 values. Peak magnitudes are nonnegative, allowing unsigned atomic maximum to retain the largest peak until rendering swaps it to zero. RMS is the latest callback's reading. The terminal event loop polls at 40 ms intervals when idle. Meter rendering consumes the peak hold, so rendering has a deliberate side effect.
+
+Display ballistics run only on the UI thread using elapsed time: the peak envelope falls at 36 dB/s, and the peak marker and numeric reading hold for one second before falling at 18 dB/s. CLIP remains visible for one second after the last clipping peak. Starting a new route resets this state. Every channel's peak is consumed even when the panel cannot fit all channel rows.
 
 ### Stream lifecycle
 

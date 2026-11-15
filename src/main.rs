@@ -1,6 +1,7 @@
 //! Terminal/control thread. All stream lifecycle work stays outside audio callbacks.
 
 mod audio;
+mod meters;
 mod safety;
 mod state;
 
@@ -31,6 +32,7 @@ struct App {
     engine: Option<Engine>,
     confirming: bool,
     status: String,
+    meters: meters::Panel,
 }
 impl App {
     fn new(saved: state::State) -> Result<Self> {
@@ -46,6 +48,7 @@ impl App {
             engine: None,
             confirming: false,
             status: "Stopped. Select devices, then press Enter.".into(),
+            meters: meters::Panel::default(),
         };
         app.restore_selection();
         Ok(app)
@@ -112,6 +115,7 @@ impl App {
         };
         match Engine::start(&input.device, &output.device, self.buffer) {
             Ok(engine) => {
+                self.meters = meters::Panel::default();
                 self.engine = Some(engine);
                 self.status = "Routing. Space: stop / m: mute".into();
             }
@@ -122,7 +126,7 @@ impl App {
             }
         }
     }
-    fn draw(&self, frame: &mut Frame) {
+    fn draw(&mut self, frame: &mut Frame) {
         let areas = Layout::vertical([
             Constraint::Length(3),
             Constraint::Percentage(40),
@@ -190,31 +194,10 @@ impl App {
                 columns[index],
             );
         }
-        let mut meter_lines = Vec::new();
-        if let Some(engine) = &self.engine {
-            for (ch, meter) in engine.stats.meters.iter().enumerate() {
-                // Rendering consumes the peak hold. A concurrent input update
-                // appears either in this frame or the next, without blocking it.
-                let peak = f32::from_bits(meter.peak.swap(0, Relaxed));
-                let rms = f32::from_bits(meter.rms.load(Relaxed));
-                let db = |x: f32| 20.0 * x.max(0.000001).log10();
-                let bars = (((db(peak) + 60.0) / 60.0).clamp(0.0, 1.0) * 24.0) as usize;
-                meter_lines.push(format!(
-                    "CH {:2} [{:<24}] peak {:6.1} dBFS / RMS {:6.1} {}",
-                    ch + 1,
-                    "#".repeat(bars),
-                    db(peak),
-                    db(rms),
-                    if peak >= 1.0 { "CLIP" } else { "" }
-                ));
-            }
-        } else {
-            meter_lines.push("Input meters appear while routing.".into());
-        }
-        frame.render_widget(
-            Paragraph::new(meter_lines.join("\n"))
-                .block(Block::default().borders(Borders::ALL).title("Input levels")),
+        self.meters.draw(
+            frame,
             areas[2],
+            self.engine.as_ref().map(|engine| engine.stats.as_ref()),
         );
         let details = if let Some(engine) = &self.engine {
             let s = &engine.stats;
@@ -423,6 +406,7 @@ mod tests {
             engine: None,
             confirming: false,
             status: String::new(),
+            meters: meters::Panel::default(),
         };
         app.restore_selection();
         assert_eq!(app.current_state(), saved);

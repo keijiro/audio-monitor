@@ -74,7 +74,7 @@ These durations are for one buffer, not the complete input-to-output delay. The 
 
 ## Levels and channel routing
 
-Each input channel has a peak meter and an RMS level reading in dBFS. A peak at or above 0 dBFS displays **CLIP**. Muting silences the output without stopping the input meters.
+Each input channel has a segmented meter with a −60 to 0 dBFS scale. Bright segments show RMS, shaded segments show the peak envelope, and a marker holds the peak for one second before falling. Segments turn yellow above −18 dBFS and red above −6 dBFS. Wide terminals also show the held peak and current RMS readings in dBFS. A peak at or above 0 dBFS displays **CLIP** for one second. Muting silences the output without stopping the input meters.
 
 Mono input is copied to every output channel. Otherwise, input channel N goes to output channel N. Extra input channels are discarded and extra output channels stay silent. Stereo input sent to a mono output uses only the left channel.
 

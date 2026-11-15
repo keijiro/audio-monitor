@@ -18,6 +18,7 @@ Once dependencies have been fetched, add `--offline` to build, test, and Clippy 
 - `src/main.rs`: terminal lifecycle, device selection, feedback confirmation, and rendering.
 - `src/audio.rs`: device configuration, stream lifecycle, metering, buffering, and sample-rate conversion.
 - `src/safety.rs`: device-name feedback heuristic and its tests.
+- `src/state.rs`: JSON persistence, buffer validation, and unambiguous device-name matching.
 
 ## Audio architecture
 
@@ -59,7 +60,7 @@ Name matching is case-insensitive substring matching against microphone and spea
 
 ## Validation
 
-The five automated tests cover warning-name matches and non-matches, startup priming, underrun recovery, channel separation, and the direction of drift correction. They do not exercise physical streams, terminal key delivery, or prove long-term control-loop stability.
+Automated tests cover warning-name matches and non-matches, startup priming, underrun recovery, channel separation, the direction of drift correction, settings persistence and replacement, malformed settings, and restoration across reordered, missing, or duplicate device names. Persistence tests use temporary directories rather than the user's saved settings. They do not exercise physical streams, terminal key delivery, or prove long-term control-loop stability.
 
 Release builds, all five tests, formatting, Clippy with warnings denied, and the release binary's `--help` invocation have passed in the development environment. Basic operation has been reported by the user. The explicit-pause stop fix has been rebuilt and checked, but its physical playback behavior remains to be confirmed.
 
@@ -71,3 +72,4 @@ For hardware validation:
 4. Run independent devices for an extended period, including different nominal sample rates; watch queue occupancy and error counters.
 5. Test unplug/replug and sleep/wake, including startup failures and subsequent retries.
 6. Measure end-to-end latency using a physical loopback and an impulse or correlated test signal. Record hardware, sample rates, buffer requests, and observed callback lengths with the result.
+7. Change both device selections and the buffer size, quit with q or Ctrl-C, and relaunch. Verify the choices return with audio stopped. Disconnect a saved device, relaunch, and check the warning and empty selection; reconnect and press r to restore it.

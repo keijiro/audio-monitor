@@ -37,6 +37,20 @@ Allow microphone access when macOS asks. If the app cannot receive input, check 
 
 Device selection and buffer changes are available only while stopped. Device names appear as reported by macOS.
 
+## Remembered settings
+
+On exit with **q** or **Ctrl-C**, the app saves the selected input, output, and requested buffer size to:
+
+```text
+~/Library/Application Support/audio-monitor/state.json
+```
+
+The next launch restores these selections but always starts with audio stopped. Running, mute, and feedback-confirmation state are not restored.
+
+Devices are matched by their exact names, independently of enumeration order. If a saved device is missing or multiple devices share its name, that selection stays empty and a message asks you to select a device or refresh with **r**. The saved name is retained until you select a replacement, so reconnecting and refreshing can restore it.
+
+A missing state file uses the defaults. An unreadable or invalid file shows a warning and uses defaults; the next exit attempts to save the current settings. Save failures are reported in the terminal after the UI closes. Writes replace the file atomically. Delete the file to reset the remembered settings while the app is closed. Forced termination does not save settings; when multiple instances run, the last successful save wins.
+
 ## Feedback warnings
 
 When the input name looks like a microphone and the output name looks like speakers, the app warns about possible acoustic feedback. **Routing does not start until you press y.** The warning is shown again on each connection attempt.

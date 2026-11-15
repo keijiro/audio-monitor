@@ -18,6 +18,8 @@ If you have already built the app, launch it directly:
 
 Select an input and an output using **Tab** and the **arrow keys**, then press **Enter** to start. Press **Space** to stop.
 
+Stopping or quitting fades the output to silence over 10 ms and allows the final audio buffer to play before stopping the device, reducing clicks from an abrupt cutoff.
+
 Allow microphone access when macOS asks. If the app cannot receive input, check **System Settings → Privacy & Security → Microphone** and enable access for the terminal app you use to launch it.
 
 ## Controls

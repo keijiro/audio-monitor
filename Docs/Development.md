@@ -53,7 +53,9 @@ Display ballistics run only on the UI thread using elapsed time: the peak envelo
 
 `App` owns an optional `Engine`: selecting devices does not create streams, and removing the engine requests shutdown. Device and buffer changes are restricted to the stopped state. A risky route enters a modal confirmation state before stream creation; device changes are ignored while that confirmation is pending, so approval applies to the displayed pair.
 
-`Engine` is constructed before either stream starts, allowing its destructor to handle partial startup failure. Shutdown sets mute, pauses output, then pauses input. Explicit pause is necessary with CPAL 0.15's macOS implementation: its disconnect listener captures a stream clone, so dropping the application's handle alone may leave the stream alive. Pause errors are ignored during destruction; muting provides an additional output safeguard. This workaround stops playback but does not resolve the backend's retained ownership, so repeated reconnects may retain resources. Revisit it when upgrading CPAL.
+`Engine` is constructed before either stream starts, allowing its destructor to handle partial startup failure. Normal shutdown requests a 10 ms linear fade on the output callback, using output-frame units and the same gain for every channel. The envelope persists across callbacks and reaches silence even without input. After fading, callbacks keep writing silence until the predicted playback delay plus the duration of the final buffer has elapsed. CPAL 0.15's Core Audio backend estimates playback delay from the buffer size, so hardware validation remains necessary.
+
+Only the control thread waits for this acknowledgement, with a 250 ms limit; a stream error skips the wait. An output stream that never successfully started also skips the wait. Shutdown then sets fallback mute, pauses output, and pauses input. Explicit pause is necessary with CPAL 0.15's macOS implementation: its disconnect listener captures a stream clone, so dropping the application's handle alone may leave the stream alive. Pause errors are ignored during destruction; muting provides an additional output safeguard. This workaround stops playback but does not resolve the backend's retained ownership, so repeated reconnects may retain resources. Revisit it when upgrading CPAL.
 
 Stream/DSP errors set an atomic flag. The UI drops the engine and reports a generic error without automatically rerouting. Device removal and sleep/wake recovery require manual refresh and reconnection.
 
@@ -63,13 +65,13 @@ Name matching is case-insensitive substring matching against microphone and spea
 
 ## Validation
 
-Automated tests cover warning-name matches and non-matches, startup priming, underrun recovery, channel separation, the direction of drift correction, settings persistence and replacement, malformed settings, and restoration across reordered, missing, or duplicate device names. Persistence tests use temporary directories rather than the user's saved settings. They do not exercise physical streams, terminal key delivery, or prove long-term control-loop stability.
+Automated tests cover warning-name matches and non-matches, startup priming, underrun recovery, channel separation, the direction of drift correction, shutdown fading across callback boundaries, shutdown without input, playback-drain timing, unsigned output silence, settings persistence and replacement, malformed settings, and restoration across reordered, missing, or duplicate device names. Persistence tests use temporary directories rather than the user's saved settings. They do not exercise physical streams, terminal key delivery, or prove long-term control-loop stability.
 
-Release builds, all five tests, formatting, Clippy with warnings denied, and the release binary's `--help` invocation have passed in the development environment. Basic operation has been reported by the user. The explicit-pause stop fix has been rebuilt and checked, but its physical playback behavior remains to be confirmed.
+Basic operation has been reported by the user. Shutdown fading is covered by automated tests; its audible behavior on physical devices remains to be confirmed.
 
 For hardware validation:
 
-1. Use headphones to check start, stop, mute, meters, and channel mapping. Repeat start/stop and verify that old streams do not remain audible.
+1. Use headphones to check start, stop, mute, meters, and channel mapping. While playing a continuous signal, stop with Space/Esc and quit with q/Ctrl-C; check for clicks at every buffer setting. Repeat start/stop and verify that old streams do not remain audible.
 2. Select a microphone/speaker pair and verify that Enter opens confirmation without starting audio. Check cancellation and repeat confirmation on reconnect.
 3. Compare 64–512 frame requests and record observed callback lengths and dropout counts.
 4. Run independent devices for an extended period, including different nominal sample rates; watch queue occupancy and error counters.

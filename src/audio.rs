@@ -15,10 +15,66 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed},
     Arc,
 };
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 
 // This is the resampler's output quantum, independent of device callback lengths.
 // A smaller quantum reduces staging delay but increases refill overhead.
 const BLOCK: usize = 64;
+const FADE_OUT: Duration = Duration::from_millis(10);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct Shutdown {
+    requested: AtomicBool,
+    drained: AtomicBool,
+}
+
+/// Output-frame envelope, shared by every channel and retained across callbacks.
+struct FadeOut {
+    frames: usize,
+    remaining: Option<usize>,
+    silence_until: Option<Instant>,
+}
+
+impl FadeOut {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            frames: (sample_rate as f64 * FADE_OUT.as_secs_f64())
+                .ceil()
+                .max(1.0) as usize,
+            remaining: None,
+            silence_until: None,
+        }
+    }
+
+    fn gain(&mut self, stopping: bool) -> f32 {
+        if stopping && self.remaining.is_none() {
+            self.remaining = Some(self.frames);
+        }
+        match &mut self.remaining {
+            Some(remaining) => {
+                *remaining = remaining.saturating_sub(1);
+                *remaining as f32 / self.frames as f32
+            }
+            None => 1.0,
+        }
+    }
+
+    fn drained(&mut self, now: Instant, playback_delay: Duration, buffer: Duration) -> bool {
+        if self.remaining != Some(0) {
+            return false;
+        }
+        // Finishing a buffer does not mean the device has played it. Keep sending
+        // silence through its predicted playback time plus the entire last buffer.
+        let deadline = self
+            .silence_until
+            .get_or_insert_with(|| now + playback_delay + buffer);
+        now >= *deadline
+    }
+}
 
 /// Float bit patterns avoid locks between the input callback and terminal renderer.
 /// Peak is a hold consumed by the UI; RMS represents the latest input callback.
@@ -61,6 +117,8 @@ pub struct Engine {
     // Own streams until stopped; callbacks own their preallocated DSP state.
     _input: cpal::Stream,
     _output: cpal::Stream,
+    output_started: bool,
+    shutdown: Arc<Shutdown>,
     pub stats: Arc<Stats>,
     pub description: String,
     pub input_rate: u32,
@@ -70,8 +128,20 @@ impl Drop for Engine {
     fn drop(&mut self) {
         // CPAL 0.15's Core Audio disconnect listener retains a Stream clone.
         // Dropping our handles alone therefore does not reliably stop playback.
-        // Mute first as a fallback if pausing fails; attempt both pauses even if
-        // one fails. This stops playback but cannot break the backend's ownership
+        // Fade and drain before pausing, so an arbitrary waveform is not cut off.
+        // Only the control thread waits; failed/stalled devices have a time limit.
+        self.shutdown.requested.store(true, Relaxed);
+        if self.output_started {
+            let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+            while !self.shutdown.drained.load(Relaxed)
+                && !self.stats.failed.load(Relaxed)
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        // Mute as a fallback if fading or pausing fails; attempt both pauses even
+        // if one fails. This stops playback but cannot break the backend's ownership
         // cycle, which should be revisited on a CPAL upgrade.
         self.stats.muted.store(true, Relaxed);
         let _ = self._output.pause();
@@ -164,6 +234,7 @@ impl Engine {
             meters: (0..channels).map(|_| Meter::default()).collect(),
             ..Stats::default()
         });
+        let shutdown = Arc::new(Shutdown::default());
         let input_stream = match inf {
             SampleFormat::F32 => input_stream::<f32>(input, &ic, producer, stats.clone()),
             SampleFormat::I16 => input_stream::<i16>(input, &ic, producer, stats.clone()),
@@ -184,11 +255,18 @@ impl Engine {
             position: BLOCK,
             primed: false,
             correction: 0.0,
+            fade: FadeOut::new(oc.sample_rate.0),
         };
         let output_stream = match outf {
-            SampleFormat::F32 => output_stream::<f32>(output, &oc, dsp, stats.clone()),
-            SampleFormat::I16 => output_stream::<i16>(output, &oc, dsp, stats.clone()),
-            SampleFormat::U16 => output_stream::<u16>(output, &oc, dsp, stats.clone()),
+            SampleFormat::F32 => {
+                output_stream::<f32>(output, &oc, dsp, stats.clone(), shutdown.clone())
+            }
+            SampleFormat::I16 => {
+                output_stream::<i16>(output, &oc, dsp, stats.clone(), shutdown.clone())
+            }
+            SampleFormat::U16 => {
+                output_stream::<u16>(output, &oc, dsp, stats.clone(), shutdown.clone())
+            }
             _ => unreachable!(),
         }?;
         let description = format!(
@@ -202,9 +280,11 @@ impl Engine {
             ic.buffer_size,
             oc.buffer_size
         );
-        let engine = Self {
+        let mut engine = Self {
             _input: input_stream,
             _output: output_stream,
+            output_started: false,
+            shutdown,
             stats,
             description,
             input_rate: ic.sample_rate.0,
@@ -212,6 +292,7 @@ impl Engine {
         // Establish the cleanup guard before starting either device so a partial
         // startup failure also pauses any stream that has already started.
         engine._output.play()?;
+        engine.output_started = true;
         engine._input.play()?;
         Ok(engine)
     }
@@ -290,8 +371,50 @@ struct OutputDsp {
     position: usize, // Next unread output frame; BLOCK means a refill is needed.
     primed: bool,
     correction: f64,
+    fade: FadeOut,
 }
 impl OutputDsp {
+    fn render<T: Sample + cpal::FromSample<f32>>(
+        &mut self,
+        data: &mut [T],
+        stats: &Stats,
+        shutdown: &Shutdown,
+    ) {
+        stats
+            .output_callback
+            .store((data.len() / self.out_channels) as u64, Relaxed);
+        // Prefill prevents replaying stale device data on silence or a failed refill.
+        data.fill(T::from_sample(0.0));
+        if stats.failed.load(Relaxed) {
+            return;
+        }
+        let mut exhausted = false;
+        for frame in data.chunks_exact_mut(self.out_channels) {
+            let gain = self.fade.gain(shutdown.requested.load(Relaxed));
+            if gain == 0.0 {
+                break;
+            }
+            // Advance the envelope even during priming/underruns, so stopping
+            // never depends on fresh input arriving.
+            if exhausted || (self.position == BLOCK && !self.refill(stats)) {
+                exhausted = true;
+                continue;
+            }
+            for (ch, sample) in frame.iter_mut().enumerate() {
+                // Mono duplicates to all outputs; otherwise preserve channel order.
+                // Muting still consumes audio to prevent a backlog when unmuting.
+                let source = if self.channels == 1 { 0 } else { ch };
+                let value = if stats.muted.load(Relaxed) || source >= self.channels {
+                    0.0
+                } else {
+                    self.output[source][self.position] * gain
+                };
+                *sample = T::from_sample(value);
+            }
+            self.position += 1;
+        }
+    }
+
     fn refill(&mut self, stats: &Stats) -> bool {
         let available = self.consumer.slots() / self.channels;
         stats.queued.store(available as u64, Relaxed);
@@ -347,40 +470,27 @@ fn output_stream<T>(
     config: &cpal::StreamConfig,
     mut dsp: OutputDsp,
     stats: Arc<Stats>,
+    shutdown: Arc<Shutdown>,
 ) -> Result<cpal::Stream>
 where
     T: SizedSample + cpal::FromSample<f32>,
 {
     let errors = stats.clone();
+    let sample_rate = config.sample_rate.0 as f64;
     Ok(device.build_output_stream(
         config,
-        move |data: &mut [T], _| {
-            stats
-                .output_callback
-                .store((data.len() / dsp.out_channels) as u64, Relaxed);
-            // Prefill ensures that a failed refill leaves the rest of the callback
-            // silent instead of replaying uninitialized or previous device data.
-            data.fill(T::from_sample(0.0));
-            if stats.failed.load(Relaxed) {
-                return;
-            }
-            for frame in data.chunks_exact_mut(dsp.out_channels) {
-                if dsp.position == BLOCK && !dsp.refill(&stats) {
-                    break;
-                }
-                for (ch, sample) in frame.iter_mut().enumerate() {
-                    // Mono duplicates to all outputs. Otherwise preserve channel order;
-                    // unmatched outputs are silent, unmatched inputs are not mixed down.
-                    // Muting still consumes audio so unmuting does not play a backlog.
-                    let source = if dsp.channels == 1 { 0 } else { ch };
-                    let value = if stats.muted.load(Relaxed) || source >= dsp.channels {
-                        0.0
-                    } else {
-                        dsp.output[source][dsp.position]
-                    };
-                    *sample = T::from_sample(value);
-                }
-                dsp.position += 1;
+        move |data: &mut [T], info| {
+            dsp.render(data, &stats, &shutdown);
+            let now = Instant::now();
+            let timestamp = info.timestamp();
+            let delay = timestamp
+                .playback
+                .duration_since(&timestamp.callback)
+                .unwrap_or_default();
+            let buffer =
+                Duration::from_secs_f64((data.len() / dsp.out_channels) as f64 / sample_rate);
+            if dsp.fade.drained(now, delay, buffer) {
+                shutdown.drained.store(true, Relaxed);
             }
         },
         move |_| {
@@ -422,6 +532,7 @@ mod tests {
             position: BLOCK,
             primed: false,
             correction: 0.0,
+            fade: FadeOut::new(48000),
         };
         (producer, dsp, Stats::default())
     }
@@ -461,5 +572,61 @@ mod tests {
         assert!(!dsp.primed);
         assert!(!dsp.refill(&stats));
         assert_eq!(stats.underruns.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn shutdown_fades_both_channels_across_callbacks_and_stays_silent() {
+        let (mut producer, mut dsp, stats) = fixture();
+        let shutdown = Shutdown::default();
+        for _ in 0..1800 {
+            producer.push(0.25).unwrap();
+            producer.push(-0.25).unwrap();
+        }
+        // Let the sinc filter settle before measuring the shutdown envelope.
+        dsp.render(&mut [0.0f32; 1024], &stats, &shutdown);
+        shutdown.requested.store(true, Relaxed);
+        let mut rendered = Vec::new();
+        for frames in [1, 63, 80, 128, 256] {
+            let mut data = vec![1.0f32; frames * 2];
+            dsp.render(&mut data, &stats, &shutdown);
+            rendered.extend(data);
+        }
+        for (i, frame) in rendered.as_chunks::<2>().0.iter().enumerate() {
+            let expected = 0.25 * (1.0 - ((i + 1).min(480) as f32 / 480.0));
+            assert!((frame[0] - expected).abs() < 1e-4, "frame {i}: {frame:?}");
+            assert!((frame[0] + frame[1]).abs() < 1e-6);
+        }
+        let mut later = [1.0f32; 128];
+        dsp.render(&mut later, &stats, &shutdown);
+        assert!(later.iter().all(|&value| value == 0.0));
+    }
+
+    #[test]
+    fn shutdown_finishes_without_input_and_waits_for_device_playback() {
+        let (_producer, mut dsp, stats) = fixture();
+        dsp.fade = FadeOut::new(44100);
+        let shutdown = Shutdown::default();
+        shutdown.requested.store(true, Relaxed);
+        let now = Instant::now();
+        let delay = Duration::from_millis(3);
+        let buffer = Duration::from_millis(5);
+        let mut silent = [1.0f32; 880];
+        dsp.render(&mut silent, &stats, &shutdown);
+        assert!(silent.iter().all(|&value| value == 0.0));
+        assert!(!dsp.fade.drained(now, delay, buffer));
+        // 441 frames at 44.1 kHz: finishing requires one more frame.
+        dsp.render(&mut [0.0f32; 2], &stats, &shutdown);
+        assert!(!dsp.fade.drained(now, delay, buffer));
+        assert!(!dsp
+            .fade
+            .drained(now + Duration::from_millis(7), delay, buffer));
+        assert!(dsp
+            .fade
+            .drained(now + Duration::from_millis(8), delay, buffer));
+        // Unsigned output silence is its midpoint, not integer zero.
+        let mut unsigned = [0u16; 16];
+        dsp.render(&mut unsigned, &stats, &shutdown);
+        assert!(unsigned.iter().all(|&value| value == 32768));
+        assert_eq!(stats.underruns.load(Relaxed), 0);
     }
 }
